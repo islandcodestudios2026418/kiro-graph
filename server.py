@@ -9,17 +9,64 @@ from mcp.types import Tool, TextContent
 DB_PATH = Path(os.environ.get("KIRO_GRAPH_DB", Path.home() / "kiro-graph" / "graph.db"))
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+VALID_CATEGORIES = [
+    "data-format", "api-integration", "build-deploy", "logic-bug",
+    "performance", "config", "git-workflow", "loop-control", "review-pattern"
+]
+
 def get_db() -> sqlite3.Connection:
-    db = sqlite3.connect(str(DB_PATH))
+    db = sqlite3.connect(str(DB_PATH), timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=5000")
     return db
+
+def migrate_db(db: sqlite3.Connection):
+    """Migrate from v1 to v2 if needed."""
+    cols = {row[1] for row in db.execute("PRAGMA table_info(entities)").fetchall()}
+    if "category" not in cols:
+        db.execute("ALTER TABLE entities ADD COLUMN category TEXT")
+        db.execute("ALTER TABLE entities ADD COLUMN q_value REAL DEFAULT 0.5")
+        db.execute("ALTER TABLE entities ADD COLUMN use_count INTEGER DEFAULT 0")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_entities_category ON entities(category)")
+        # Rebuild FTS to include category
+        db.execute("DROP TABLE IF EXISTS entities_fts")
+        db.execute("DROP TRIGGER IF EXISTS entities_ai")
+        db.execute("DROP TRIGGER IF EXISTS entities_ad")
+        db.execute("DROP TRIGGER IF EXISTS entities_au")
+        db.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+                name, body, project, agent, type, category,
+                content='entities', content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+                INSERT INTO entities_fts(rowid, name, body, project, agent, type, category)
+                VALUES (new.rowid, new.name, new.body, new.project, new.agent, new.type, new.category);
+            END;
+            CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+                INSERT INTO entities_fts(entities_fts, rowid, name, body, project, agent, type, category)
+                VALUES ('delete', old.rowid, old.name, old.body, old.project, old.agent, old.type, old.category);
+            END;
+            CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
+                INSERT INTO entities_fts(entities_fts, rowid, name, body, project, agent, type, category)
+                VALUES ('delete', old.rowid, old.name, old.body, old.project, old.agent, old.type, old.category);
+                INSERT INTO entities_fts(rowid, name, body, project, agent, type, category)
+                VALUES (new.rowid, new.name, new.body, new.project, new.agent, new.type, new.category);
+            END;
+        """)
+        # Re-index existing entities into FTS
+        rows = db.execute("SELECT rowid, name, body, project, agent, type, category FROM entities").fetchall()
+        for r in rows:
+            db.execute("INSERT INTO entities_fts(rowid, name, body, project, agent, type, category) VALUES (?,?,?,?,?,?,?)",
+                       (r["rowid"], r["name"], r["body"], r["project"], r["agent"], r["type"], r["category"]))
+        db.commit()
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = get_db()
     db.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    migrate_db(db)
     db.close()
 
 def now() -> str:
@@ -105,6 +152,37 @@ async def list_tools():
                 "project": {"type": "string", "description": "Filter by project (optional)"},
             },
             "required": []
+        }),
+        Tool(name="graph_learn", description="Record a categorized skill/experience for cross-agent sharing. Use after solving a non-trivial problem.", inputSchema={
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Your agent name"},
+                "project": {"type": "string", "description": "Project where this was learned"},
+                "category": {"type": "string", "enum": ["data-format", "api-integration", "build-deploy", "logic-bug", "performance", "config", "git-workflow", "loop-control", "review-pattern"], "description": "Problem category"},
+                "trigger": {"type": "string", "description": "When does this problem occur? (the symptom/situation)"},
+                "solution": {"type": "string", "description": "What to do (the fix/approach)"},
+                "pitfalls": {"type": "string", "description": "What NOT to do / common mistakes"},
+                "evidence": {"type": "array", "items": {"type": "string"}, "description": "File paths, URLs, log refs"},
+            },
+            "required": ["agent", "category", "trigger", "solution"]
+        }),
+        Tool(name="graph_recall", description="Search for skills by category and/or query. Use BEFORE starting a non-trivial task to check if someone already solved this.", inputSchema={
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "enum": ["data-format", "api-integration", "build-deploy", "logic-bug", "performance", "config", "git-workflow", "loop-control", "review-pattern"], "description": "Filter by problem category"},
+                "query": {"type": "string", "description": "Free-text search within skills"},
+                "limit": {"type": "integer", "default": 5, "description": "Max results"},
+            },
+            "required": []
+        }),
+        Tool(name="graph_reward", description="Update Q-value on a skill after using it. Call with reward=1.0 if it helped, 0.0 if misleading.", inputSchema={
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string", "description": "ID of the skill entity"},
+                "reward": {"type": "number", "description": "0.0 (useless/wrong) to 1.0 (perfect). Learning rate alpha=0.1"},
+                "agent": {"type": "string", "description": "Who used this skill"},
+            },
+            "required": ["skill_id", "reward"]
         }),
     ]
 
@@ -222,6 +300,92 @@ async def call_tool(name: str, arguments: dict):
         ).fetchall()
         out = {"tensions": [dict(r) for r in rows], "stale_projects": [r["project"] for r in stale if r["project"]]}
         return [TextContent(type="text", text=json.dumps(out, indent=2, ensure_ascii=False))]
+
+    elif name == "graph_learn":
+        eid = str(uuid.uuid4())[:8]
+        category = arguments["category"]
+        if category not in VALID_CATEGORIES:
+            return [TextContent(type="text", text=f"Invalid category: {category}. Must be one of: {', '.join(VALID_CATEGORIES)}")]
+        # Build structured body
+        body_parts = [f"TRIGGER: {arguments['trigger']}", f"SOLUTION: {arguments['solution']}"]
+        if arguments.get("pitfalls"):
+            body_parts.append(f"PITFALLS: {arguments['pitfalls']}")
+        body = "\n".join(body_parts)
+        # Name = "category: short trigger description"
+        skill_name = f"{category}: {arguments['trigger'][:80]}"
+        evidence = json.dumps(arguments.get("evidence", []))
+        db.execute(
+            "INSERT INTO entities (id,type,name,project,agent,status,body,evidence,category,q_value,use_count,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (eid, "skill", skill_name, arguments.get("project"), arguments["agent"], "active", body, evidence, category, 0.5, 0, ts, ts)
+        )
+        db.execute("INSERT INTO events (ts, agent, project, action, entity_id, msg) VALUES (?,?,?,?,?,?)",
+                   (ts, arguments["agent"], arguments.get("project"), "learn", eid, f"Learned: {skill_name}"))
+        db.commit()
+        return [TextContent(type="text", text=f"Skill recorded: {skill_name} (id={eid}, category={category}, Q=0.5)")]
+
+    elif name == "graph_recall":
+        category = arguments.get("category")
+        query = arguments.get("query")
+        limit = arguments.get("limit", 5)
+
+        if query and category:
+            # FTS search filtered by category
+            rows = db.execute(
+                "SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
+                "FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
+                "WHERE entities_fts MATCH ? AND e.type='skill' AND e.category=? AND e.status='active' "
+                "ORDER BY e.q_value DESC LIMIT ?",
+                (query, category, limit)
+            ).fetchall()
+        elif category:
+            # All skills in category, sorted by Q-value
+            rows = db.execute(
+                "SELECT id, name, category, body, q_value, use_count, agent, project, updated "
+                "FROM entities WHERE type='skill' AND category=? AND status='active' "
+                "ORDER BY q_value DESC LIMIT ?",
+                (category, limit)
+            ).fetchall()
+        elif query:
+            # FTS search across all skills
+            rows = db.execute(
+                "SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
+                "FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
+                "WHERE entities_fts MATCH ? AND e.type='skill' AND e.status='active' "
+                "ORDER BY e.q_value DESC LIMIT ?",
+                (query, limit)
+            ).fetchall()
+        else:
+            # No filter: top skills by Q-value
+            rows = db.execute(
+                "SELECT id, name, category, body, q_value, use_count, agent, project, updated "
+                "FROM entities WHERE type='skill' AND status='active' "
+                "ORDER BY q_value DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+
+        results = [dict(r) for r in rows]
+        if not results:
+            return [TextContent(type="text", text="No skills found. You're on your own — record what you learn with graph_learn!")]
+        return [TextContent(type="text", text=json.dumps(results, indent=2, ensure_ascii=False))]
+
+    elif name == "graph_reward":
+        skill_id = arguments["skill_id"]
+        reward = max(0.0, min(1.0, arguments["reward"]))  # clamp [0, 1]
+        alpha = 0.1  # learning rate
+
+        row = db.execute("SELECT q_value, use_count FROM entities WHERE id=? AND type='skill'", (skill_id,)).fetchone()
+        if not row:
+            return [TextContent(type="text", text=f"Skill not found: {skill_id}")]
+
+        old_q = row["q_value"] or 0.5
+        new_q = round(old_q + alpha * (reward - old_q), 4)
+        new_count = (row["use_count"] or 0) + 1
+
+        db.execute("UPDATE entities SET q_value=?, use_count=?, updated=? WHERE id=?", (new_q, new_count, ts, skill_id))
+        db.execute("INSERT INTO events (ts, agent, project, action, entity_id, msg) VALUES (?,?,?,?,?,?)",
+                   (ts, arguments.get("agent", "unknown"), None, "reward", skill_id, f"Q: {old_q}→{new_q} (reward={reward})"))
+        db.commit()
+        return [TextContent(type="text", text=f"Q-value updated: {old_q} → {new_q} (reward={reward}, uses={new_count})")]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

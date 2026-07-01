@@ -1,4 +1,4 @@
--- kiro-graph schema v1
+-- kiro-graph schema v2
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,          -- project, decision, task, skill, tension, artifact, agent
@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS entities (
     status TEXT DEFAULT 'active', -- active, done, superseded, rejected, retired
     body TEXT,                   -- free-form content (markdown, JSON, etc)
     evidence TEXT,               -- JSON array of sources ["log:2026-06-09T...", "file:path"]
+    category TEXT,              -- skill category (data-format, api-integration, build-deploy, logic-bug, performance, config, git-workflow, loop-control, review-pattern)
+    q_value REAL DEFAULT 0.5,  -- reinforcement learning Q-value [0.0 - 1.0]
+    use_count INTEGER DEFAULT 0, -- how many times this skill was used
     created TEXT NOT NULL,
     updated TEXT NOT NULL
 );
@@ -33,26 +36,26 @@ CREATE TABLE IF NOT EXISTS events (
 
 -- FTS for semantic-ish search over entities
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
-    name, body, project, agent, type,
+    name, body, project, agent, type, category,
     content='entities', content_rowid='rowid'
 );
 
 -- Triggers to keep FTS in sync
 CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
-    INSERT INTO entities_fts(rowid, name, body, project, agent, type)
-    VALUES (new.rowid, new.name, new.body, new.project, new.agent, new.type);
+    INSERT INTO entities_fts(rowid, name, body, project, agent, type, category)
+    VALUES (new.rowid, new.name, new.body, new.project, new.agent, new.type, new.category);
 END;
 
 CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
-    INSERT INTO entities_fts(entities_fts, rowid, name, body, project, agent, type)
-    VALUES ('delete', old.rowid, old.name, old.body, old.project, old.agent, old.type);
+    INSERT INTO entities_fts(entities_fts, rowid, name, body, project, agent, type, category)
+    VALUES ('delete', old.rowid, old.name, old.body, old.project, old.agent, old.type, old.category);
 END;
 
 CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
-    INSERT INTO entities_fts(entities_fts, rowid, name, body, project, agent, type)
-    VALUES ('delete', old.rowid, old.name, old.body, old.project, old.agent, old.type);
-    INSERT INTO entities_fts(rowid, name, body, project, agent, type)
-    VALUES (new.rowid, new.name, new.body, new.project, new.agent, new.type);
+    INSERT INTO entities_fts(entities_fts, rowid, name, body, project, agent, type, category)
+    VALUES ('delete', old.rowid, old.name, old.body, old.project, old.agent, old.type, old.category);
+    INSERT INTO entities_fts(rowid, name, body, project, agent, type, category)
+    VALUES (new.rowid, new.name, new.body, new.project, new.agent, new.type, new.category);
 END;
 
 -- Indexes
@@ -60,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
 CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project);
 CREATE INDEX IF NOT EXISTS idx_entities_agent ON entities(agent);
 CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(status);
+CREATE INDEX IF NOT EXISTS idx_entities_category ON entities(category);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
 CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel);
