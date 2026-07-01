@@ -166,11 +166,13 @@ async def list_tools():
             },
             "required": ["agent", "category", "trigger", "solution"]
         }),
-        Tool(name="graph_recall", description="Search for skills by category and/or query. Use BEFORE starting a non-trivial task to check if someone already solved this.", inputSchema={
+        Tool(name="graph_recall", description="Search for skills by category and/or query. Defaults to your own project's skills. Set global=true to search all projects.", inputSchema={
             "type": "object",
             "properties": {
                 "category": {"type": "string", "enum": ["data-format", "api-integration", "build-deploy", "logic-bug", "performance", "config", "git-workflow", "loop-control", "review-pattern"], "description": "Filter by problem category"},
                 "query": {"type": "string", "description": "Free-text search within skills"},
+                "project": {"type": "string", "description": "Filter by project (defaults to your project — acts as per-team KB)"},
+                "global": {"type": "boolean", "description": "Set true to search ALL projects, not just your own. Default: false"},
                 "limit": {"type": "integer", "default": 5, "description": "Max results"},
             },
             "required": []
@@ -326,44 +328,73 @@ async def call_tool(name: str, arguments: dict):
     elif name == "graph_recall":
         category = arguments.get("category")
         query = arguments.get("query")
+        project = arguments.get("project")
+        is_global = arguments.get("global", False)
         limit = arguments.get("limit", 5)
 
+        # Build project filter
+        proj_clause = ""
+        proj_params = []
+        if not is_global and project:
+            proj_clause = "AND e.project=?"
+            proj_params = [project]
+
         if query and category:
-            # FTS search filtered by category
             rows = db.execute(
-                "SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
-                "FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
-                "WHERE entities_fts MATCH ? AND e.type='skill' AND e.category=? AND e.status='active' "
-                "ORDER BY e.q_value DESC LIMIT ?",
-                (query, category, limit)
+                f"SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
+                f"FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
+                f"WHERE entities_fts MATCH ? AND e.type='skill' AND e.category=? AND e.status='active' {proj_clause} "
+                f"ORDER BY e.q_value DESC LIMIT ?",
+                (query, category, *proj_params, limit)
             ).fetchall()
         elif category:
-            # All skills in category, sorted by Q-value
             rows = db.execute(
-                "SELECT id, name, category, body, q_value, use_count, agent, project, updated "
-                "FROM entities WHERE type='skill' AND category=? AND status='active' "
-                "ORDER BY q_value DESC LIMIT ?",
-                (category, limit)
+                f"SELECT id, name, category, body, q_value, use_count, agent, project, updated "
+                f"FROM entities WHERE type='skill' AND category=? AND status='active' {proj_clause.replace('e.', '')} "
+                f"ORDER BY q_value DESC LIMIT ?",
+                (category, *proj_params, limit)
             ).fetchall()
         elif query:
-            # FTS search across all skills
             rows = db.execute(
-                "SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
-                "FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
-                "WHERE entities_fts MATCH ? AND e.type='skill' AND e.status='active' "
-                "ORDER BY e.q_value DESC LIMIT ?",
-                (query, limit)
+                f"SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
+                f"FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
+                f"WHERE entities_fts MATCH ? AND e.type='skill' AND e.status='active' {proj_clause} "
+                f"ORDER BY e.q_value DESC LIMIT ?",
+                (query, *proj_params, limit)
             ).fetchall()
         else:
-            # No filter: top skills by Q-value
             rows = db.execute(
-                "SELECT id, name, category, body, q_value, use_count, agent, project, updated "
-                "FROM entities WHERE type='skill' AND status='active' "
-                "ORDER BY q_value DESC LIMIT ?",
-                (limit,)
+                f"SELECT id, name, category, body, q_value, use_count, agent, project, updated "
+                f"FROM entities WHERE type='skill' AND status='active' {proj_clause.replace('e.', '')} "
+                f"ORDER BY q_value DESC LIMIT ?",
+                (*proj_params, limit)
             ).fetchall()
 
         results = [dict(r) for r in rows]
+        # If no results in project scope, hint about global search
+        if not results and not is_global and project:
+            # Auto-fallback: try global
+            if query:
+                rows = db.execute(
+                    "SELECT e.id, e.name, e.category, e.body, e.q_value, e.use_count, e.agent, e.project, e.updated "
+                    "FROM entities_fts f JOIN entities e ON f.rowid = e.rowid "
+                    "WHERE entities_fts MATCH ? AND e.type='skill' AND e.status='active' "
+                    "ORDER BY e.q_value DESC LIMIT ?",
+                    (query, limit)
+                ).fetchall()
+            elif category:
+                rows = db.execute(
+                    "SELECT id, name, category, body, q_value, use_count, agent, project, updated "
+                    "FROM entities WHERE type='skill' AND category=? AND status='active' "
+                    "ORDER BY q_value DESC LIMIT ?",
+                    (category, limit)
+                ).fetchall()
+            else:
+                rows = []
+            global_results = [dict(r) for r in rows]
+            if global_results:
+                return [TextContent(type="text", text=json.dumps({"your_project": [], "global_matches": global_results, "hint": "No skills in your project, but found matches from other teams. Use global=true to include these."}, indent=2, ensure_ascii=False))]
+            return [TextContent(type="text", text="No skills found. You're on your own — record what you learn with graph_learn!")]
         if not results:
             return [TextContent(type="text", text="No skills found. You're on your own — record what you learn with graph_learn!")]
         return [TextContent(type="text", text=json.dumps(results, indent=2, ensure_ascii=False))]
